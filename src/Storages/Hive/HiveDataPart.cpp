@@ -23,16 +23,11 @@
 #include <parquet/arrow/reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/statistics.h>
+#include <arrow/adapters/orc/adapter.h>
 
 
 namespace DB
 {
-#define THROW_ARROW_NOT_OK(status) \
-    do \
-    { \
-        if (const ::arrow::Status & _s = (status); !_s.ok()) \
-            throw Exception(_s.ToString(), ErrorCodes::BAD_ARGUMENTS); \
-    } while (false)
 
 template <class FieldType, class StatisticsType>
 Range createRangeFromParquetStatistics(std::shared_ptr<StatisticsType> stats)
@@ -59,6 +54,7 @@ HiveDataPart::HiveDataPart(
     const String & relative_path_,
     const DiskPtr & disk_,
     const HivePartInfo & info_,
+    const String & format_name_,
     std::unordered_set<Int64> skip_splits_,
     NamesAndTypesList index_names_and_types_)
     : name(name_)
@@ -66,6 +62,7 @@ HiveDataPart::HiveDataPart(
     , relative_path(relative_path_)
     , disk(disk_)
     , info(info_)
+    , format_name(format_name_)
     , skip_splits(skip_splits_)
     , index_names_and_types(index_names_and_types_)
 {
@@ -86,6 +83,11 @@ String HiveDataPart::getHDFSUri() const
     return hdfs_uri;
 }
 
+String HiveDataPart::getFormatName() const
+{
+    return format_name;
+}
+
 HiveDataPart::~HiveDataPart() = default;
 
 void HiveDataPart::loadSplitMinMaxIndexes()
@@ -96,127 +98,112 @@ void HiveDataPart::loadSplitMinMaxIndexes()
     split_minmax_idxes_loaded = true;
 }
 
-size_t HiveDataPart::getTotalRowGroups() const
-{
-    size_t res;
-    {
-        std::lock_guard lock(mutex);
-        if (!reader)
-            prepareReader();
-
-        auto meta = reader->parquet_reader()->metadata();
-        if (meta)
-            res = meta->num_row_groups();
-        else
-            throw Exception("Unexpected error of getTotalRowGroups. because of meta is NULL", ErrorCodes::LOGICAL_ERROR);
-    }
-    return res;
-}
-
-void HiveDataPart::prepareReader() const
+arrow::Status HiveDataPart::tryGetTotalRowGroups(size_t & res) const
 {
     if (!disk)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Hive disk is not set");
 
-    in = disk->readFile(getFullDataPartPath());
-    THROW_ARROW_NOT_OK(parquet::arrow::OpenFile(asArrowFile(*in), arrow::default_memory_pool(), &reader));
+    std::unique_ptr<ReadBuffer> in = disk->readFile(getFullDataPartPath());
+    std::unique_ptr<parquet::arrow::FileReader> reader = nullptr;
+    arrow::Status read_status = parquet::arrow::OpenFile(asArrowFile(*in), arrow::default_memory_pool(), &reader);
+    if (read_status.ok())
+    {
+        auto parquet_meta = reader->parquet_reader()->metadata();
+        if (parquet_meta)
+            res = parquet_meta->num_row_groups();
+        else
+            res = 0;
+    }
+    else
+        res = 0;
+
+    return read_status;
+}
+
+size_t HiveDataPart::getTotalRowGroups() const
+{
+    if (total_row_groups != 0)
+        return total_row_groups;
+
+    size_t res = 0;
+    arrow::Status read_status = tryGetTotalRowGroups(res);
+    if (!read_status.ok())
+        throw Exception("Unexpected error of getTotalRowGroups. because of meta is NULL", ErrorCodes::LOGICAL_ERROR);
+
+    total_row_groups = res;
+
+    LOG_TRACE(&Poco::Logger::get("HiveDataPart"), " num_row_groups: {} total_row_groups: {}", res, total_row_groups);
+
+    return res;
+}
+
+arrow::Status HiveDataPart::tryGetTotalStripes(size_t & res) const
+{
+    if (!disk)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Hive disk is not set");
+
+    std::unique_ptr<ReadBuffer> in = disk->readFile(getFullDataPartPath());
+    std::unique_ptr<arrow::adapters::orc::ORCFileReader> reader = nullptr;
+    arrow::Status read_status = arrow::adapters::orc::ORCFileReader::Open(asArrowFile(*in), arrow::default_memory_pool(), &reader);
+    if (read_status.ok())
+        res = reader->NumberOfStripes();
+    else
+        res = 0;
+
+    return read_status;
+}
+
+size_t HiveDataPart::getTotalStripes() const
+{
+    if (total_stripes != 0)
+        return total_stripes;
+
+    size_t res = 0;
+    arrow::Status read_status = tryGetTotalStripes(res);
+    if (!read_status.ok())
+        throw Exception("Unexpected error of getTotalStripes. because of meta is NULL", ErrorCodes::LOGICAL_ERROR);
+
+    total_stripes = res;
+
+    LOG_TRACE(&Poco::Logger::get("HiveDataPart"), "res = {} total_stripes = {}", res, total_stripes);
+
+    return res;
+}
+
+size_t HiveDataPart::getTotalBlockNumber() const
+{
+    size_t res = 0;
+    if (toFileFormat(format_name) == FileFormat::ORC)
+        res = getTotalStripes();
+    else if (toFileFormat(format_name) == FileFormat::PARQUET)
+        res = getTotalRowGroups();
+    else
+        throw Exception("Unexpected Format in CnchHive ,currently only support Parquet/orc", ErrorCodes::LOGICAL_ERROR);
+
+    return res;
+}
+
+void HiveDataPart::loadSplitMinMaxIndexesImpl()
+{
+    if (toFileFormat(format_name) == FileFormat::ORC)
+        loadOrcSplitMinMaxIndexesImpl();
+    else if (toFileFormat(format_name) == FileFormat::PARQUET)
+        loadParquetSplitMinMaxIndexesImpl();
+    else
+        throw Exception("Unexpected Format in CnchHive ,currently only support Parquet/orc", ErrorCodes::LOGICAL_ERROR);
+}
+
+void HiveDataPart::loadOrcSplitMinMaxIndexesImpl()
+{
+    /// TODO:
 }
 
 /// use arrow library, loop parquet datapart row groups
 /// build requried column min、max range.
 /// currently only support basic data type
-void HiveDataPart::loadSplitMinMaxIndexesImpl()
+void HiveDataPart::loadParquetSplitMinMaxIndexesImpl()
 {
-    // if(!reader)
-    //     prepareReader();
-
-    // auto meta = reader->parquet_reader()->metadata();
-    // size_t num_cols = meta->num_columns();
-    // size_t num_row_groups = meta->num_row_groups();
-    // const auto * schema = meta->schema();
-    // for(size_t pos = 0; pos < num_cols; ++pos)
-    // {
-    //     String column{schema->Column(pos)->name()};
-    //     boost::to_lower(column);
-    //     parquet_column_positions[column] = pos;
-    // }
-
-    // split_minmax_idxes.resize(num_row_groups);
-    // // LOG_TRACE(&Logger::get("HiveDataPart"), " num_row_groups: " << num_row_groups << " index_names_and_types size: " << index_names_and_types.size());
-
-    // for(size_t i = 0; i < num_row_groups; ++i)
-    // {
-    //     auto row_group_meta = meta->RowGroup(i);
-    //     split_minmax_idxes[i] = std::make_shared<IMergeTreeDataPart::MinMaxIndex>();
-    //     split_minmax_idxes[i]->parallelogram.resize(num_cols);
-
-    //     size_t j = 0;
-    //     auto it = index_names_and_types.begin();
-    //     for(; it != index_names_and_types.end(); ++j, ++it)
-    //     {
-    //         String column{it->name};
-
-    //         boost::to_lower(column);
-    //         auto mit = parquet_column_positions.find(column);
-    //         if(mit == parquet_column_positions.end())
-    //             continue;
-
-    //         size_t pos = mit->second;
-    //         auto col_chunk = row_group_meta->ColumnChunk(pos);
-    //         if(!col_chunk->is_stats_set())
-    //             continue;
-
-    //         auto stats = col_chunk->statistics();
-    //         if(stats->null_count() > 0)
-    //             continue;
-
-    //         if(auto bool_status = std::dynamic_pointer_cast<parquet::BoolStatistics>(stats))
-    //         {
-    //             split_minmax_idxes[i]->parallelogram[j] = createRangeFromParquetStatistics<UInt8>(bool_status);
-    //         }
-    //         else if(auto int32_stats = std::dynamic_pointer_cast<parquet::Int32Statistics>(stats))
-    //         {
-    //             split_minmax_idxes[i]->parallelogram[j] = createRangeFromParquetStatistics<Int32>(int32_stats);
-    //         }
-    //         else if(auto int64_stats = std::dynamic_pointer_cast<parquet::Int64Statistics>(stats))
-    //         {
-    //             split_minmax_idxes[i]->parallelogram[j] = createRangeFromParquetStatistics<Int64>(int64_stats);
-    //         }
-    //         else if(auto float_stats = std::dynamic_pointer_cast<parquet::FloatStatistics>(stats))
-    //         {
-    //             split_minmax_idxes[i]->parallelogram[j] = createRangeFromParquetStatistics<Float64>(float_stats);
-    //         }
-    //         else if(auto double_stats = std::dynamic_pointer_cast<parquet::FloatStatistics>(stats))
-    //         {
-    //             split_minmax_idxes[i]->parallelogram[j] = createRangeFromParquetStatistics<Float64>(double_stats);
-    //         }
-    //         else if(auto string_stats = std::dynamic_pointer_cast<parquet::ByteArrayStatistics>(stats))
-    //         {
-    //             split_minmax_idxes[i]->parallelogram[j] = createRangeFromParquetStatistics(string_stats);
-    //         }
-    //         /// Other type are not supported for minmax index, skip
-
-    //     }
-    //     split_minmax_idxes[i]->initialized = true;
-    // }
-
-    // for(auto split_minmax_idx : split_minmax_idxes)
-    // {
-    //     // LOG_TRACE(&Logger::get("HiveDataPart"), " idx: " << describeMinMaxIndex(split_minmax_idx));
-    // }
+    /// TODO:
 }
-
-// String HiveDataPart::describeMinMaxIndex(const MinMaxIndexPtr & idx) const
-// {
-//     if(!idx)
-//         return "";
-
-//     std::vector<String> strs;
-//     strs.reserve(index_names_and_types.size());
-//     size_t i = 0;
-//     for(const auto & name_type : index_names_and_types)
-//         strs.push_back(name_type.name + ":" + name_type.type->getName() + idx->parallelogram[i++].toString());
-//     return boost::algorithm::join(strs, "|");
-// }
 
 }

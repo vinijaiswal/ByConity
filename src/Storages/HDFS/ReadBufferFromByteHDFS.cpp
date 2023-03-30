@@ -23,7 +23,7 @@ namespace DB
 
 static void ReadBufferFromHdfsCallBack(const hdfsEvent & event)
 {
-    LOG_TRACE(&Poco::Logger::get("ReadBufferFromHDFS"), "get event {} & {}", event.eventType, event.value);
+    LOG_TRACE(&Poco::Logger::get("ReadBufferFromByteHDFS"), "get event {} & {}", event.eventType, event.value);
     switch (event.eventType)
     {
         case Hdfs::Event::HDFS_EVENT_SLOWNODE:
@@ -118,6 +118,18 @@ ReadBufferFromByteHDFS::ReadBufferFromByteHDFS(
 ReadBufferFromByteHDFS::~ReadBufferFromByteHDFS()
 {
     close();
+}
+
+size_t ReadBufferFromByteHDFS::getFileSize()
+{
+    tryConnect();
+
+    Poco::URI uri(uriPrefix + hdfs_files[current_pos]);
+    auto & hdfs_file_path = uri.getPath();
+    auto * file_info = hdfsGetPathInfo(fs.get(), hdfs_file_path.c_str());
+    if (!file_info)
+        throw Exception(ErrorCodes::UNKNOWN_FILE_SIZE, "Cannot find out file size for: {}", hdfs_file_path);
+    return file_info->mSize;
 }
 
 void ReadBufferFromByteHDFS::close()

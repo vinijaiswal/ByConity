@@ -31,7 +31,7 @@ namespace DB
 CnchHiveReadPool::CnchHiveReadPool(
     const size_t & threads_,
     const size_t & sum_row_groups_,
-    RowGroupsInDataParts && parts_,
+    BlocksInDataParts && parts_,
     const StorageCloudHive & data_,
     const StorageMetadataPtr & metadata_snapshot_,
     Names column_names_)
@@ -42,17 +42,11 @@ CnchHiveReadPool::CnchHiveReadPool(
 }
 
 ///
-void CnchHiveReadPool::fillPerThreadInfo(const size_t & threads, const size_t & sum_row_groups, RowGroupsInDataParts data_parts)
+void CnchHiveReadPool::fillPerThreadInfo(const size_t & threads, const size_t & sum_row_groups, BlocksInDataParts data_parts)
 {
     threads_tasks.resize(threads);
     const size_t min_row_groups_per_thread = (sum_row_groups - 1) / threads + 1;
     threads_row_groups_sum.resize(threads, 0);
-
-    LOG_TRACE(
-        &Poco::Logger::get("CnchHiveReadPool"),
-        " threads: {} min_row_groups_per_thread: {} ",
-        threads,
-        min_row_groups_per_thread);
 
     size_t i = 0;
     size_t current_row_group_index = 0;
@@ -63,15 +57,8 @@ void CnchHiveReadPool::fillPerThreadInfo(const size_t & threads, const size_t & 
     {
         const auto part_idx = data_parts.size() - 1;
         const auto & part = data_parts.back().data_part;
-        size_t row_groups_in_part = part->getTotalRowGroups();
+        size_t row_groups_in_part = part->getTotalBlockNumber();
         std::string path = part->getFullDataPartPath();
-
-        LOG_TRACE(
-        &Poco::Logger::get("CnchHiveReadPool"),
-        " part_idx: {} row_groups_in_part: {}  path = {}",
-        part_idx,
-        row_groups_in_part,
-        path);
 
         if (row_groups_in_part == 0)
         {
@@ -118,41 +105,6 @@ void CnchHiveReadPool::fillPerThreadInfo(const size_t & threads, const size_t & 
             data_parts.pop_back();
         }
     }
-
-    for (size_t cnt = 0; cnt < threads; cnt++)
-    {
-        auto thread_task = threads_tasks[cnt];
-        auto parts_and_groups = thread_task.parts_and_groups;
-        auto sum_row_groups_in_parts = threads_row_groups_sum[cnt];
-
-        LOG_TRACE(
-            &Poco::Logger::get("CnchHiveReadPool"),
-            "current thread : {}  parts_and_groups size: {} sum_row_groups_in_parts size: {}",
-            cnt,
-            parts_and_groups.size(),
-            sum_row_groups_in_parts);
-
-        for (size_t j = 0; j < parts_and_groups.size(); j++)
-        {
-            auto part_idx = parts_and_groups[j].part_idx;
-            auto need_read_row_group_index = parts_and_groups[j].need_read_row_group_index;
-
-            LOG_TRACE(
-                &Poco::Logger::get("CnchHiveReadPool"),
-                " part_idx: {} need_read_row_group_index: {}",
-                part_idx,
-                need_read_row_group_index);
-
-            auto path = parts[part_idx].data_part->getFullDataPartPath();
-
-            LOG_TRACE(
-                &Poco::Logger::get("CnchHiveReadPool"),
-                " part_idx: {} path: {} need_read_row_group_index: {} ",
-                part_idx,
-                path,
-                need_read_row_group_index);
-        }
-    }
 }
 
 Block CnchHiveReadPool::getHeader() const
@@ -162,7 +114,6 @@ Block CnchHiveReadPool::getHeader() const
 
 CnchHiveReadTaskPtr CnchHiveReadPool::getTask(const size_t & thread)
 {
-    LOG_TRACE(&Poco::Logger::get("CnchHiveReadPool"), " getTask ");
     const std::lock_guard lock{mutex};
 
     if (thread >= backoff_state.current_threads)

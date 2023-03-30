@@ -29,12 +29,12 @@ class CnchHiveThreadSelectBlockInputProcessor : public SourceWithProgress
 {
 public:
     CnchHiveThreadSelectBlockInputProcessor(
-        const size_t & thread,
-        const std::shared_ptr<CnchHiveReadPool> & pool,
-        const StorageCloudHive & storage,
+        const size_t & thread_,
+        const std::shared_ptr<CnchHiveReadPool> & pool_,
+        const StorageCloudHive & storage_,
         const StorageMetadataPtr & metadata_snapshot_,
-        ContextPtr & context,
-        const UInt64 & max_block_size);
+        ContextPtr & context_,
+        const UInt64 & max_block_size_);
 
     String getName() const override { return "CnchHiveThread"; }
 
@@ -61,7 +61,7 @@ private:
 
     std::unique_ptr<ReadBuffer> read_buf;
 
-    BlockInputStreamPtr parquet_stream;
+    BlockInputStreamPtr stream;
 };
 
 }

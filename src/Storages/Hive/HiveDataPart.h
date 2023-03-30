@@ -27,11 +27,34 @@
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 
 
-namespace parquet { namespace arrow { class FileReader; } }
-namespace arrow { class Buffer; }
+namespace orc
+{
+class Statistics;
+class ColumnStatistics;
+}
+namespace parquet
+{
+class Statistics;
+class ColumnStatistics;
+}
+namespace arrow
+{
+    class FileReader;
+    class Buffer;
+    class Status;
+}
+namespace arrow::adapters::orc
+{
+class ORCFileReader;
+class Statistics;
+class ColumnStatistics;
+}
 
 namespace DB
 {
+
+class ParquetBlockInputStream;
+class ORCBlockInputStream;
 
 struct HivePartInfo
 {
@@ -83,6 +106,31 @@ public:
     using MinMaxIndex = IMergeTreeDataPart::MinMaxIndex;
     using MinMaxIndexPtr = std::shared_ptr<MinMaxIndex>;
 
+    enum class FileFormat
+    {
+        PARQUET,
+        ORC,
+    };
+
+    inline static const String PARQUET_INPUT_FORMAT = "com.cloudera.impala.hive.serde.ParquetInputFormat";
+    inline static const String MR_PARQUET_INPUT_FORMAT = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat";
+    inline static const String ORC_INPUT_FORMAT = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
+    inline static const std::map<String, FileFormat> VALID_HDFS_FORMATS = {
+        {PARQUET_INPUT_FORMAT, FileFormat::PARQUET},
+        {MR_PARQUET_INPUT_FORMAT, FileFormat::PARQUET},
+        {ORC_INPUT_FORMAT, FileFormat::ORC},
+    };
+
+    static inline bool isFormatClass(const String & format_class) { return VALID_HDFS_FORMATS.count(format_class) > 0; }
+    static inline FileFormat toFileFormat(const String & format_class)
+    {
+        if (isFormatClass(format_class))
+        {
+            return VALID_HDFS_FORMATS.find(format_class)->second;
+        }
+        throw Exception("Unsupported hdfs file format " + format_class, ErrorCodes::NOT_IMPLEMENTED);
+    }
+
 public:
     HiveDataPart(
         const String & name_,
@@ -90,24 +138,32 @@ public:
         const String & relative_path_,
         const DiskPtr & disk_,
         const HivePartInfo & info_,
+        const String & format_name_,
         std::unordered_set<Int64> skip_splits_ = {},
         NamesAndTypesList index_names_and_types_ = {});
 
     String getFullDataPartPath() const;
     String getFullTablePath() const;
     String getHDFSUri() const;
+    String getFormatName() const;
 
     const std::unordered_set<Int64> & getSkipSplits() const { return skip_splits; }
     void setSkipSplits(const std::unordered_set<Int64> & skip_splits_) { skip_splits = skip_splits_; }
 
-    String describeMinMaxIndex(const MinMaxIndexPtr & idx) const;
-    const std::vector<MinMaxIndexPtr> & getSubMinMaxIndexes() const { return split_minmax_idxes; }
+    size_t getTotalBlockNumber() const;
+
     void loadSplitMinMaxIndexes();
     void loadSplitMinMaxIndexesImpl();
-    void prepareReader() const;
     size_t getTotalRowGroups() const;
+    size_t getTotalStripes() const;
+    arrow::Status tryGetTotalRowGroups(size_t & num_row_groups) const;
+    arrow::Status tryGetTotalStripes(size_t & res) const;
 
     ~HiveDataPart();
+
+private:
+    void loadParquetSplitMinMaxIndexesImpl();
+    void loadOrcSplitMinMaxIndexesImpl();
 
 public:
 
@@ -116,6 +172,10 @@ public:
     String relative_path;
     DiskPtr disk;
     HivePartInfo info;
+    String format_name;
+
+    mutable size_t total_row_groups = 0;
+    mutable size_t total_stripes = 0;
 
     std::unordered_set<Int64> skip_splits = {};
     NamesAndTypesList index_names_and_types = {};
@@ -125,10 +185,6 @@ public:
 
     mutable std::atomic<bool> initialized{false};
 
-    mutable std::mutex mutex;
-
-    mutable std::unique_ptr<ReadBuffer> in;
-    mutable std::unique_ptr<parquet::arrow::FileReader> reader;
     mutable std::map<String, size_t> parquet_column_positions;
 };
 

@@ -15,14 +15,24 @@
 
 #include <DataStreams/OwningBlockInputStream.h>
 #include <Formats/FormatFactory.h>
-#include <Processors/Formats/Impl/ParquetBlockInputFormat.h>
 #include <Storages/HDFS/ReadBufferFromByteHDFS.h>
-#include <Storages/Hive/ParquetBlockInputStream.h>
 #include <Storages/MergeTree/CnchHiveThreadSelectBlockInputProcessor.h>
+
+#include <Common/config.h>
+
+// #if USE_ORC || USE_PARQUET
+#    include <Processors/Formats/Impl/ParquetBlockInputFormat.h>
+#    include <Processors/Formats/Impl/ORCBlockInputFormat.h>
+#    include <Storages/Hive/ParquetBlockInputStream.h>
+#    include <Storages/Hive/ORCBlockInputStream.h>
+#    include <arrow/adapters/orc/adapter.h>
+#    include <parquet/arrow/reader.h>
+
 
 namespace DB
 {
 class ParquetBlockInputFormat;
+class ORCBlockInputFormat;
 
 CnchHiveThreadSelectBlockInputProcessor::CnchHiveThreadSelectBlockInputProcessor(
     const size_t & thread_,
@@ -44,7 +54,6 @@ Block CnchHiveThreadSelectBlockInputProcessor::getHeader() const
 
 Chunk CnchHiveThreadSelectBlockInputProcessor::generate()
 {
-    LOG_TRACE(&Poco::Logger::get("CnchHiveThreadSelectBlockInputProcessor"), " generate ");
     Block res;
 
     while (!res && !isCancelled())
@@ -52,13 +61,12 @@ Chunk CnchHiveThreadSelectBlockInputProcessor::generate()
         if (!task && !getNewTask())
             break;
 
-        res = parquet_stream->read();
+        const auto * parquet = dynamic_cast<const ParquetBlockInputStream *>(stream.get());
+        const auto * orc = dynamic_cast<const ORCBlockInputStream *>(stream.get());
+        if (!parquet && !orc)
+            throw Exception("Unexpected Format in CnchHive ,currently only support Parquet/ORC", ErrorCodes::LOGICAL_ERROR);
 
-        LOG_TRACE(&Poco::Logger::get("CnchHiveThreadSelectBlockInputProcessor"), " parquet read rows: {}", res.rows());
-
-        const auto * parquet = dynamic_cast<const ParquetBlockInputStream *>(parquet_stream.get());
-        if (!parquet)
-            throw Exception("Unexpected Format in CnchHive ,currently only support Parquet", ErrorCodes::LOGICAL_ERROR);
+        res = stream->read();
 
         // if(parquet->isFinished())
         // {
@@ -67,7 +75,7 @@ Chunk CnchHiveThreadSelectBlockInputProcessor::generate()
 
         task.reset();
         read_buf.reset();
-        parquet_stream.reset();
+        stream.reset();
     }
 
     return Chunk(res.getColumns(), res.rows());
@@ -80,13 +88,18 @@ bool CnchHiveThreadSelectBlockInputProcessor::getNewTask()
     if (!task)
     {
         read_buf.reset();
-        parquet_stream.reset();
+        stream.reset();
         return false;
     }
 
     auto & part = task->data_part;
     size_t current_row_group = task->current_row_group;
     const String part_path = part->getFullDataPartPath();
+    const String part_format = part->getFormatName();
+    bool is_parquet_format = false;
+
+    if (part_format.find("parquet") != String::npos)
+        is_parquet_format = true;
 
     LOG_TRACE(
         &Poco::Logger::get("CnchHiveThreadSelectBlockInputStream"),
@@ -96,23 +109,29 @@ bool CnchHiveThreadSelectBlockInputProcessor::getNewTask()
     read_buf = std::make_unique<ReadBufferFromByteHDFS>(part_path, true, context->getHdfsConnectionParams());
 
     FormatSettings format_settings;
-    format_settings.parquet.partition_kv = part->info.getPartition();
-    format_settings.parquet.skip_row_groups = part->getSkipSplits();
-    format_settings.parquet.current_row_group = current_row_group;
-    format_settings.parquet.read_one_group = true;
+    if (part_format.find("parquet") != String::npos)
+    {
+        format_settings.parquet.partition_kv = part->info.getPartition();
+        format_settings.parquet.skip_row_groups = part->getSkipSplits();
+        format_settings.parquet.current_row_group = current_row_group;
+        format_settings.parquet.read_one_group = true;
 
-    auto parquet_format = FormatFactory::instance().getInput(
-        "Parquet", *read_buf, getHeader(), context, context->getSettingsRef().max_block_size, format_settings);
+        auto parquet_format = FormatFactory::instance().getInput(
+            "Parquet", *read_buf, getHeader(), context, context->getSettingsRef().max_block_size, format_settings);
 
-    // auto parquet_format = std::make_shared<ParquetBlockInputFormat>(
-    //     *read_buf,
-    //     getHeader(),
-    //     part->info.getPartition(),
-    //     part->getSkipSplits(),
-    //     current_row_group,
-    //     true);
+        stream = std::make_shared<ParquetBlockInputStream>(parquet_format);
+    }
+    else if (part_format.find("orc") != String::npos)
+    {
+        format_settings.orc.partition_kv = part->info.getPartition();
 
-    parquet_stream = std::make_shared<ParquetBlockInputStream>(parquet_format);
+        auto orc_format = FormatFactory::instance().getInput(
+            "ORC", *read_buf, getHeader(), context, context->getSettingsRef().max_block_size, format_settings);
+
+        stream = std::make_shared<ORCBlockInputStream>(orc_format);
+    }
+    else
+        throw Exception("Unexpected Format in CnchHive ,currently only support Parquet/ORC", ErrorCodes::LOGICAL_ERROR);
 
     return true;
 }

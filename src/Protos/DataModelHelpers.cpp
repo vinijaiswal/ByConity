@@ -413,6 +413,7 @@ void fillCnchHivePartsModel(const HiveDataPartsCNCHVector & parts, pb::RepeatedP
         *info.mutable_name() = part->info.name;
         *info.mutable_partition_id() = part->info.partition_id;
         *part_model.mutable_relative_path() = part->relative_path;
+        *part_model.mutable_format_name() = part->getFormatName();
         part_model.set_skip_lists(size);
         part_model.set_hdfs_uri(part->getHDFSUri());
 
@@ -450,12 +451,15 @@ createCnchHiveDataParts(const ContextPtr & context, const pb::RepeatedPtrField<P
             disk = std::make_shared<DiskByteHDFS>(part.hdfs_uri(), "", params);
         }
 
+        const auto & format_name = part.format_name();
+
         res.emplace_back(std::make_shared<const HiveDataPart>(
             part_name,
             part.relative_path(),
             part.has_hdfs_uri() ? part.hdfs_uri() : context->getHdfsNNProxy(),
             disk,
             HivePartInfo(part_name, partition_id),
+            format_name,
             required_skip_lists));
     }
     return res;

@@ -103,12 +103,6 @@ StorageCnchHive::StorageCnchHive(
     metadata.setColumns(columns_);
     metadata.setConstraints(constraints_);
 
-    for(const auto & col : columns_)
-    {
-        LOG_TRACE(log, " StorageCnchHive : col name {}  table name {}, database name{} ", col.name, table_id_.table_name, table_id_.database_name);
-
-    }
-
     setInMemoryMetadata(metadata);
 
     //only when create table, need to check schema and storage format.
@@ -174,10 +168,6 @@ void StorageCnchHive::setProperties()
     if (!partition_by_ast)
         throw Exception("PARTITION BY cannot be empty", ErrorCodes::BAD_ARGUMENTS);
 
-    size_t col_size = getColumns().size();
-
-    LOG_TRACE(log, " setProperties col_size : {}  remote_database_name {} remote_table_name {}", col_size, remote_database, remote_table);
-
     auto all_columns = getInMemoryMetadataPtr()->getColumns().getAllPhysical();
     partition_key_expr_list = extractKeyExpressionList(partition_by_ast);
     if (!partition_key_expr_list->children.empty())
@@ -228,9 +218,9 @@ void StorageCnchHive::setProperties()
 void StorageCnchHive::checkStorageFormat()
 {
     auto table = getHiveTable();
-    const String format = table->sd.outputFormat;
-    if (format.find("parquet") == String::npos)
-        throw Exception("CnchHive only support parquet format. Current format is " + format + " .", ErrorCodes::BAD_ARGUMENTS);
+    const String format = (*table).sd.inputFormat;
+    if ((format.find("parquet") == String::npos) && (format.find("orc") == String::npos))
+        throw Exception("CnchHive only support parquet/orc format. Current format is " + format + " .", ErrorCodes::BAD_ARGUMENTS);
 }
 
 bool StorageCnchHive::isBucketTable() const
@@ -309,11 +299,6 @@ void StorageCnchHive::checkClusterByKey()
 {
     auto table = getHiveTable();
     const auto & hivebucket_cols = table->sd.bucketCols;
-    LOG_TRACE(log, " hivebucket_cols size = {}", hivebucket_cols.size());
-
-    for (const auto & col : hivebucket_cols)
-        LOG_TRACE(log, " hivebucket_cols col = {}", col);
-
 
     if (cluster_by_ast)
     {
@@ -337,7 +322,6 @@ void StorageCnchHive::checkClusterByKey()
         for (size_t i = 0; i < cluster_by_expr_size; ++i)
         {
             const String clustering_key_column = cluster_by_expr_list_local->children[i]->getColumnName();
-            LOG_TRACE(log, " clustering_key_column = {}", clustering_key_column);
             auto it = std::find(hivebucket_cols.begin(), hivebucket_cols.end(), clustering_key_column);
             if (it == hivebucket_cols.end())
                 throw Exception(
@@ -390,8 +374,6 @@ HiveDataPartsCNCHVector StorageCnchHive::prepareReadContext(
     LOG_INFO(log, "Number of parts to read: {}", parts.size());
 
     String local_table_name = getCloudTableName(local_context);
-
-    LOG_TRACE(log, " local table name = {}", local_table_name);
     collectResource(local_context, parts, local_table_name);
 
     return parts;
@@ -531,9 +513,6 @@ std::set<Int64> StorageCnchHive::getSelectedBucketNumbers(const SelectQueryInfo 
     auto syntax_result = TreeRewriter(local_context).analyze(bucket_column_expression, source_columns);
     ExpressionActionsPtr const_actions = ExpressionAnalyzer{bucket_column_expression, syntax_result, local_context}.getConstActions();
     const_actions->execute(sample_block);
-
-    LOG_TRACE(log, "select total_bucket_number: {} sample block size: {}", cluster_by_total_bucket_number, sample_block.columns());
-
     createHiveBucketColumn(sample_block, cluster_by_key_expr->getSampleBlock(), cluster_by_total_bucket_number, local_context);
 
     auto bucket_number = sample_block.getByPosition(sample_block.columns() - 1).column->getInt(0); // this block only contains one row
@@ -645,9 +624,6 @@ void StorageCnchHive::collectResource(ContextPtr local_context, const HiveDataPa
 {
     auto cnch_resource = local_context->getCnchServerResource();
     auto create_table_query = getCreateQueryForCloudTable(getCreateTableSql(), local_table_name, local_context);
-
-    LOG_TRACE(log, " create table query {}", create_table_query);
-
     cnch_resource->setWorkerGroup(local_context->getCurrentWorkerGroup());
     cnch_resource->addCreateQuery(local_context, shared_from_this(), create_table_query, local_table_name);
     cnch_resource->addDataParts(getStorageUUID(), parts);
@@ -678,8 +654,6 @@ void StorageCnchHive::read(
     const size_t /*max_block_size*/,
     unsigned num_streams)
 {
-    LOG_TRACE(log, " read  num_streams = {}", num_streams);
-
     auto data_parts = prepareReadContext(column_names, metadata_snapshot, query_info, local_context, num_streams);
     Block header = InterpreterSelectQuery(query_info.query, local_context, SelectQueryOptions(processed_stage)).getSampleBlock();
 
@@ -711,7 +685,6 @@ void StorageCnchHive::read(
         return;
     }
 
-    LOG_TRACE(log, "Original query before rewrite: {}", queryToString(query_info.query));
     auto modified_query_ast = rewriteSelectQuery(query_info.query, getDatabaseName(), getCloudTableName(local_context));
 
     const Scalars & scalars = local_context->hasQueryContext() ? local_context->getQueryContext()->getScalars() : Scalars{};
@@ -738,7 +711,6 @@ void registerStorageCnchHive(StorageFactory & factory)
         .supports_sort_order = true,
     };
 
-    LOG_DEBUG(&Poco::Logger::get("registerStorageCnchHive"), "registerStorageCnchHive ");
     factory.registerStorage(
         "CnchHive",
         [](const StorageFactory::Arguments & args) {
