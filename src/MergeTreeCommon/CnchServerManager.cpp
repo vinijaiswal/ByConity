@@ -227,8 +227,11 @@ void CnchServerManager::shutDown()
     try
     {
         need_stop = true;
-        lease_renew_task->deactivate();
-        topology_refresh_task->deactivate();
+        /// has to check hasTask otherwise it cause hang on shutdown
+        if (lease_renew_task.hasTask())
+            lease_renew_task->deactivate();
+        if (topology_refresh_task.hasTask())
+            topology_refresh_task->deactivate();
         leader_election.reset();
     }
     catch (...)
